@@ -1,0 +1,405 @@
+rules_version = '2';
+/**
+ * BAC-240 Shared Platform Security Rules
+ * CANDIDATE SECURITY RULES (HARDENED - PROMPT 7 EMULATOR VALIDATED)
+ * 
+ * STATUS: PREPARED & VALIDATED ON REAL FIREBASE EMULATOR — NOT DEPLOYED — AWAITING FINAL REVIEW
+ * 
+ * Core Security Architecture:
+ * 1. Admin & Owner Authorization:
+ *    request.auth.uid -> admins/{uid} -> active == true && role in ['owner', 'admin']
+ *    Self-promotion is strictly impossible.
+ * 2. Student Ownership:
+ *    request.auth.uid -> resource.data.firebaseAuthUid == request.auth.uid
+ *    Students cannot change security/identity fields (firebaseAuthUid, role, isAdmin, isOwner, activationCode).
+ * 3. Secure Leaderboard:
+ *    Public read for rankings, strict owner/admin write, private fields blocked.
+ * 4. Activation Codes:
+ *    Credential protection: list is forbidden to non-admins (prevents enumeration).
+ *    Get is limited to unused or student-owned codes.
+ * 5. Educational Content:
+ *    Public read for published materials, write strictly reserved for verified admins.
+ * 6. Default Deny:
+ *    Any unlisted collection or action is blocked.
+ */
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ==========================================
+    // CANONICAL SECURITY HELPERS
+    // ==========================================
+
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function authUid() {
+      return request.auth.uid;
+    }
+
+    function isAdminDocExists() {
+      return isAuthenticated() && exists(/databases/$(database)/documents/admins/$(request.auth.uid));
+    }
+
+    function isAdminActive() {
+      return isAdminDocExists() &&
+        get(/databases/$(database)/documents/admins/$(request.auth.uid)).data.get('active', false) == true;
+    }
+
+    function isVerifiedAdmin() {
+      return isAdminActive() &&
+        (get(/databases/$(database)/documents/admins/$(request.auth.uid)).data.get('role', '') == 'admin' ||
+         get(/databases/$(database)/documents/admins/$(request.auth.uid)).data.get('role', '') == 'owner');
+    }
+
+    function isOwner() {
+      return isAdminActive() &&
+        get(/databases/$(database)/documents/admins/$(request.auth.uid)).data.get('role', '') == 'owner';
+    }
+
+    // Student Ownership Check
+    function isStudentOwner(data) {
+      return isAuthenticated() &&
+        data.firebaseAuthUid == authUid();
+    }
+
+    // Student Initial Creation Guard
+    function isStudentCreateAllowed(incoming) {
+      return isAuthenticated() &&
+        incoming.firebaseAuthUid == authUid() &&
+        !incoming.get('isAdmin', false) &&
+        !incoming.get('isOwner', false) &&
+        incoming.get('role', 'student') == 'student' &&
+        incoming.get('adminRole', '') == '';
+    }
+
+    // Ensure student cannot elevate privileges or tamper with security fields
+    function protectedStudentFieldsUnchanged(existing, incoming) {
+      return incoming.firebaseAuthUid == existing.firebaseAuthUid &&
+        incoming.get('role', '') == existing.get('role', '') &&
+        incoming.get('isAdmin', false) == existing.get('isAdmin', false) &&
+        incoming.get('isOwner', false) == existing.get('isOwner', false) &&
+        incoming.get('adminRole', '') == existing.get('adminRole', '') &&
+        incoming.get('activationCode', '') == existing.get('activationCode', '') &&
+        incoming.get('studentCode', '') == existing.get('studentCode', '');
+    }
+
+    // ==========================================
+    // 1. ADMINS COLLECTION (HIGHLY SENSITIVE)
+    // ==========================================
+    match /admins/{adminUid} {
+      // Admin checks own record for session initialization
+      allow get: if isAuthenticated() && authUid() == adminUid;
+      // Admins can list all admins in the Admin Control Center
+      allow list: if isVerifiedAdmin();
+      // Only the verified Owner can provision new admins (self-creation blocked)
+      allow create: if isOwner() && adminUid != authUid();
+      // Only the verified Owner can update admin records (roles, status)
+      allow update: if isOwner();
+      // Only the verified Owner can remove admins, but cannot delete own root record
+      allow delete: if isOwner() && adminUid != authUid();
+    }
+
+    // ==========================================
+    // 2. STUDENTS & USERS COLLECTIONS (STUDENT OWNED)
+    // ==========================================
+    match /students/{studentId} {
+      // Individual student reads own document; Admin can read all
+      allow get: if isStudentOwner(resource.data) || isVerifiedAdmin();
+      // List/Query all student records reserved strictly for Admin
+      allow list: if isVerifiedAdmin();
+      // Creation permitted during activation with matching Firebase Auth UID
+      allow create: if isStudentCreateAllowed(request.resource.data) || isVerifiedAdmin();
+      // Updates permitted for own progress without tampering with protected fields
+      allow update: if (isStudentOwner(resource.data) && protectedStudentFieldsUnchanged(resource.data, request.resource.data)) || isVerifiedAdmin();
+      // Deletion permitted for own account or by Admin
+      allow delete: if isStudentOwner(resource.data) || isVerifiedAdmin();
+
+      // Student subcollections (if any)
+      match /{subcollection}/{subDoc=**} {
+        allow read, write: if isStudentOwner(get(/databases/$(database)/documents/students/$(studentId)).data) || isVerifiedAdmin();
+      }
+    }
+
+    match /users/{userId} {
+      allow get: if isStudentOwner(resource.data) || isVerifiedAdmin();
+      allow list: if isVerifiedAdmin();
+      allow create: if isStudentCreateAllowed(request.resource.data) || isVerifiedAdmin();
+      allow update: if (isStudentOwner(resource.data) && protectedStudentFieldsUnchanged(resource.data, request.resource.data)) || isVerifiedAdmin();
+      allow delete: if isStudentOwner(resource.data) || isVerifiedAdmin();
+
+      match /{subcollection}/{subDoc=**} {
+        allow read, write: if isStudentOwner(get(/databases/$(database)/documents/users/$(userId)).data) || isVerifiedAdmin();
+      }
+    }
+
+    // ==========================================
+    // 3. SECURE LEADERBOARD (PUBLIC READ, OWNER/ADMIN WRITE)
+    // ==========================================
+    match /leaderboard/{studentId} {
+      // Public read: any authenticated student or guest can view leaderboard rankings
+      allow read: if true;
+
+      // Creation: Authenticated student creating own entry with only public fields
+      allow create: if isVerifiedAdmin() || (
+        isAuthenticated() &&
+        request.resource.data.firebaseAuthUid == authUid() &&
+        request.resource.data.keys().hasOnly([
+          'id', 'studentId', 'fullName', 'name', 'governorate', 
+          'streakDays', 'streak', 'studyHours', 'totalStudyHours', 
+          'rankTitle', 'badge', 'points', 'completedLessonsCount', 
+          'updatedAt', 'firebaseAuthUid'
+        ]) &&
+        !request.resource.data.keys().hasAny([
+          'phone', 'phoneNumber', 'activationCode', 'deviceId', 
+          'email', 'role', 'isAdmin', 'isOwner', 'adminRole'
+        ])
+      );
+
+      // Update: Owner student updating own entry with only public fields
+      allow update: if isVerifiedAdmin() || (
+        isAuthenticated() &&
+        resource.data.firebaseAuthUid == authUid() &&
+        request.resource.data.firebaseAuthUid == authUid() &&
+        request.resource.data.keys().hasOnly([
+          'id', 'studentId', 'fullName', 'name', 'governorate', 
+          'streakDays', 'streak', 'studyHours', 'totalStudyHours', 
+          'rankTitle', 'badge', 'points', 'completedLessonsCount', 
+          'updatedAt', 'firebaseAuthUid'
+        ]) &&
+        !request.resource.data.keys().hasAny([
+          'phone', 'phoneNumber', 'activationCode', 'deviceId', 
+          'email', 'role', 'isAdmin', 'isOwner', 'adminRole'
+        ])
+      );
+
+      // Deletion: Owner student or Admin
+      allow delete: if isVerifiedAdmin() || (
+        isAuthenticated() &&
+        resource.data.firebaseAuthUid == authUid()
+      );
+    }
+
+    // ==========================================
+    // 4. ACTIVATION CODES (CREDENTIALS)
+    // ==========================================
+    match /activationCodes/{codeId} {
+      // Get single code: permitted if code is unused (for activation) or verified admin
+      allow get: if isVerifiedAdmin() || (resource.data.isUsed == false || resource.data.usedBy == authUid());
+      // List all codes: strictly forbidden to students to prevent credential enumeration
+      allow list: if isVerifiedAdmin();
+      // Burn code: student can mark code as used during activation; admin can manage
+      allow update: if isVerifiedAdmin() || (resource.data.isUsed == false && request.resource.data.isUsed == true);
+      // Admin exclusive creation and deletion
+      allow create, delete: if isVerifiedAdmin();
+    }
+
+    // ==========================================
+    // 5. STUDENT NOTIFICATIONS
+    // ==========================================
+    match /student_notifications/{notificationId} {
+      allow get, list: if isVerifiedAdmin() || (
+        isAuthenticated() && 
+        (resource.data.studentId == authUid() || resource.data.firebaseAuthUid == authUid())
+      );
+      allow update: if isVerifiedAdmin() || (
+        isAuthenticated() && 
+        (resource.data.studentId == authUid() || resource.data.firebaseAuthUid == authUid()) &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['isRead', 'readAt'])
+      );
+      allow create, delete: if isVerifiedAdmin();
+    }
+
+    // ==========================================
+    // 6. ONLINE USERS & PRESENCE
+    // ==========================================
+    match /online_users/{presenceId} {
+      allow read: if isAuthenticated() || isVerifiedAdmin();
+      allow create, update: if isAuthenticated() && (
+        presenceId == authUid() || 
+        request.resource.data.authUid == authUid() || 
+        request.resource.data.firebaseAuthUid == authUid()
+      );
+      allow delete: if isAuthenticated() && (
+        presenceId == authUid() || 
+        resource.data.authUid == authUid() || 
+        isVerifiedAdmin()
+      );
+    }
+
+    // ==========================================
+    // 7. SYSTEM SETTINGS
+    // ==========================================
+    // Public platform operational status (maintenance mode screen)
+    match /systemSettings/{settingId} {
+      allow read: if true;
+      allow write: if isVerifiedAdmin();
+      match /{subcollection}/{subDoc=**} { allow read: if true; allow write: if isVerifiedAdmin(); }
+    }
+
+    // Administrative private settings
+    match /system_settings/{settingId} {
+      allow read, write: if isVerifiedAdmin();
+      match /{subcollection}/{subDoc=**} { allow read, write: if isVerifiedAdmin(); }
+    }
+
+    // ==========================================
+    // 8. PUBLIC & EDUCATIONAL CONTENT (READ-ONLY FOR STUDENTS)
+    // ==========================================
+    match /announcements/{announcementId} {
+      allow read: if true;
+      allow write: if isVerifiedAdmin();
+    }
+
+    match /exams/{examId} {
+      // Students only read published exams; Admins read all drafts
+      allow read: if isVerifiedAdmin() || resource.data.isPublished == true;
+      allow write: if isVerifiedAdmin();
+      match /{subcollection}/{subDoc=**} {
+        allow read: if isVerifiedAdmin() || get(/databases/$(database)/documents/exams/$(examId)).data.isPublished == true;
+        allow write: if isVerifiedAdmin();
+      }
+    }
+
+    match /examCountdowns/{countdownId} {
+      allow read: if true;
+      allow write: if isVerifiedAdmin();
+    }
+
+    match /examCountdown/{countdownId} {
+      allow read: if true;
+      allow write: if isVerifiedAdmin();
+    }
+
+    match /youtubeChannels/{channelId} {
+      allow read: if true;
+      allow write: if isVerifiedAdmin();
+    }
+
+    match /youtubePlaylists/{playlistId} {
+      allow read: if true;
+      allow write: if isVerifiedAdmin();
+    }
+
+    match /youtubeVideos/{videoId} {
+      allow read: if true;
+      allow write: if isVerifiedAdmin();
+    }
+
+    match /videos/{videoId} {
+      allow read: if true;
+      allow write: if isVerifiedAdmin();
+    }
+
+    match /studyFiles/{fileId} {
+      allow read: if true;
+      allow write: if isVerifiedAdmin();
+    }
+
+    match /library/{fileId} {
+      allow read: if true;
+      allow write: if isVerifiedAdmin();
+    }
+
+    match /roadmap/{roadmapId} {
+      allow read: if true;
+      allow write: if isVerifiedAdmin();
+    }
+
+    match /curriculum/{subjectId} {
+      allow read: if true;
+      allow write: if isVerifiedAdmin();
+    }
+
+    match /mindmaps/{mindmapId} {
+      allow read: if true;
+      allow write: if isVerifiedAdmin();
+    }
+
+    match /schedule/{scheduleId} {
+      allow read: if true;
+      allow write: if isVerifiedAdmin();
+    }
+
+    match /lesson_attachments/{attachmentId} {
+      allow read: if true;
+      allow write: if isVerifiedAdmin();
+    }
+
+    match /flashcards/{cardId} {
+      allow read: if true;
+      allow write: if isVerifiedAdmin();
+    }
+
+    match /flashcardDecks/{deckId} {
+      allow read: if true;
+      allow write: if isVerifiedAdmin();
+    }
+
+    match /flashcard_decks/{deckId} {
+      allow read: if true;
+      allow write: if isVerifiedAdmin();
+    }
+
+    match /cards/{cardId} {
+      allow read: if true;
+      allow write: if isVerifiedAdmin();
+    }
+
+    match /decks/{deckId} {
+      allow read: if true;
+      allow write: if isVerifiedAdmin();
+    }
+
+    match /flashCards/{cardId} {
+      allow read: if true;
+      allow write: if isVerifiedAdmin();
+    }
+
+    match /flashCardDecks/{deckId} {
+      allow read: if true;
+      allow write: if isVerifiedAdmin();
+    }
+
+    match /planWeeks/{weekId} {
+      allow read: if true;
+      allow write: if isVerifiedAdmin();
+    }
+
+    match /studyPlans/{planId} {
+      allow read: if true;
+      allow write: if isVerifiedAdmin();
+    }
+
+    match /plans/{planId} {
+      allow read: if true;
+      allow write: if isVerifiedAdmin();
+    }
+
+    match /dailyPlans/{planId} {
+      allow read: if true;
+      allow write: if isVerifiedAdmin();
+    }
+
+    match /curriculumKnowledge/{knowledgeDocId} {
+      allow read: if true;
+      allow write: if isVerifiedAdmin();
+    }
+
+    // ==========================================
+    // 9. TEST & CONNECTIVITY PING
+    // ==========================================
+    match /test/{docId} {
+      allow read: if true;
+      allow write: if false;
+    }
+
+    // ==========================================
+    // 10. DEFAULT DENY
+    // ==========================================
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

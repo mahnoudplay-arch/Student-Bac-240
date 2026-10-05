@@ -1,0 +1,75 @@
+rules_version = '2';
+/**
+ * BAC-240 Shared Platform Storage Security Rules
+ * CANDIDATE STORAGE SECURITY RULES (DRAFT - PROMPT 5)
+ * 
+ * STATUS: PREPARED & LOCALLY VALIDATED — NOT DEPLOYED — AWAITING ADMIN CROSS-REVIEW
+ * 
+ * Core Storage Architecture:
+ * 1. Educational Public Content (PDFs, study files, attachments):
+ *    Public download for students/guests, uploads and deletions strictly reserved for verified admins.
+ * 2. Student Private Uploads:
+ *    User-scoped path `students/{studentAuthUid}/**`:
+ *    Restricted to authenticated student matching studentAuthUid.
+ * 3. Default Deny:
+ *    All unlisted bucket paths are closed.
+ */
+
+service firebase.storage {
+  match /b/{bucket}/o {
+
+    // Helper functions
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function authUid() {
+      return request.auth.uid;
+    }
+
+    function isVerifiedAdmin() {
+      return isAuthenticated() &&
+        firestore.exists(/databases/(default)/documents/admins/$(authUid())) &&
+        firestore.get(/databases/(default)/documents/admins/$(authUid())).data.active == true &&
+        (firestore.get(/databases/(default)/documents/admins/$(authUid())).data.role == 'admin' ||
+         firestore.get(/databases/(default)/documents/admins/$(authUid())).data.role == 'owner');
+    }
+
+    // 1. Educational Content & Public Assets
+    match /studyFiles/{allPaths=**} {
+      allow read: if true;
+      allow write: if isVerifiedAdmin();
+    }
+
+    match /library/{allPaths=**} {
+      allow read: if true;
+      allow write: if isVerifiedAdmin();
+    }
+
+    match /lesson_attachments/{allPaths=**} {
+      allow read: if true;
+      allow write: if isVerifiedAdmin();
+    }
+
+    match /attachments/{allPaths=**} {
+      allow read: if true;
+      allow write: if isVerifiedAdmin();
+    }
+
+    match /mindmaps/{allPaths=**} {
+      allow read: if true;
+      allow write: if isVerifiedAdmin();
+    }
+
+    // 2. Student Private Storage (Scoped by Firebase Auth UID)
+    match /students/{studentAuthUid}/{allPaths=**} {
+      allow read, write: if isAuthenticated() && authUid() == studentAuthUid;
+      allow delete: if isAuthenticated() && (authUid() == studentAuthUid || isVerifiedAdmin());
+    }
+
+    // 3. Default Deny for All Other Storage Paths
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}

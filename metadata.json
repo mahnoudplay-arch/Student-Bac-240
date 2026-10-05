@@ -1,0 +1,6 @@
+{
+  "name": "BAC - 240 | بوابة الطالب للبكالوريا العلمي 2026",
+  "description": "المنظومة الرقمية الشاملة لشهادة التعليم الثانوي العامة (الفرع العلمي) في الجمهورية العربية السورية — دورة 2026 بإشراف أ. محمود صيبعة",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
